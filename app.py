@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 from companies import COMPANIES, TICKER_TO_NAME, company_count
+from categories import CATEGORIES, SECTOR_OF, category_of
 
 # --------------------------------------------------------------------------
 # Page config
@@ -204,13 +205,157 @@ def get_insider_data(ticker: str):
     return out
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_isin(ticker: str):
     t = yf.Ticker(ticker)
     try:
         return t.isin
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------
+# Robustness layer: yfinance's `.info` summary dict is unreliable across
+# versions and tickers — fields like freeCashflow, returnOnEquity, and
+# currentRatio are frequently missing (especially for NSE tickers), even
+# though the underlying data exists in the raw financial statements.
+# These helpers backfill missing `.info` values from the statements so the
+# rest of the app doesn't silently show N/A / fail when it doesn't have to.
+# --------------------------------------------------------------------------
+
+def _row(df: pd.DataFrame, *names):
+    """Return the most recent value of the first matching row name in df."""
+    if df is None or df.empty:
+        return None
+    for name in names:
+        if name in df.index:
+            series = df.loc[name].dropna()
+            if not series.empty:
+                return float(series.iloc[0])
+    return None
+
+
+def normalize_dividend_yield(raw_value):
+    """
+    As of recent yfinance versions, `dividendYield` in the .info dict is
+    returned already as a percentage number (e.g. 1.8 meaning "1.8%"),
+    not as a fraction (0.018) like older versions returned. The rest of
+    this app's fmt_pct() multiplies by 100 assuming a fraction, so we
+    convert here to a fraction first to keep that formatting path correct
+    everywhere it's used.
+    """
+    if raw_value is None:
+        return None
+    try:
+        v = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return v / 100
+
+
+def lightweight_backfill(info: dict) -> dict:
+    """
+    A cheap version of derive_missing_metrics that only fixes unit/scale
+    issues using fields already in `.info` — no extra statement fetches.
+    Used in bulk-scan contexts (Sector Peers) where fetching full financial
+    statements for dozens of tickers would be too slow/expensive.
+    """
+    if info is None:
+        return None
+    out = dict(info)
+    out["dividendYield"] = normalize_dividend_yield(out.get("dividendYield"))
+    return out
+
+
+def derive_missing_metrics(info: dict, fin: dict) -> dict:
+    """
+    Returns a copy of `info` with key fields backfilled from the raw
+    financial statements whenever yfinance's summary dict left them out.
+    Never overwrites a value that's already present and usable.
+    """
+    out = dict(info) if info else {}
+
+    income = fin.get("income_annual")
+    balance = fin.get("balance_annual")
+    cashflow = fin.get("cashflow_annual")
+
+    # --- dividendYield: normalize units regardless of source ---
+    out["dividendYield"] = normalize_dividend_yield(out.get("dividendYield"))
+
+    # --- Free Cash Flow ---
+    if out.get("freeCashflow") is None:
+        fcf = _row(cashflow, "Free Cash Flow")
+        if fcf is None:
+            ocf = _row(cashflow, "Operating Cash Flow", "Total Cash From Operating Activities")
+            capex = _row(cashflow, "Capital Expenditure", "Capital Expenditures")
+            if ocf is not None and capex is not None:
+                # Capex is usually stored as a negative outflow already
+                fcf = ocf + capex if capex < 0 else ocf - capex
+        if fcf is not None:
+            out["freeCashflow"] = fcf
+
+    # --- Total Debt / Total Cash (used by DCF's equity bridge) ---
+    if out.get("totalDebt") is None:
+        td = _row(balance, "Total Debt")
+        if td is None:
+            std = _row(balance, "Current Debt", "Short Long Term Debt") or 0
+            ltd = _row(balance, "Long Term Debt") or 0
+            if std or ltd:
+                td = std + ltd
+        if td is not None:
+            out["totalDebt"] = td
+
+    if out.get("totalCash") is None:
+        tc = _row(balance, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments")
+        if tc is not None:
+            out["totalCash"] = tc
+
+    # --- Return on Equity ---
+    if out.get("returnOnEquity") is None:
+        net_income = _row(income, "Net Income", "Net Income Common Stockholders")
+        equity = _row(balance, "Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest")
+        if net_income is not None and equity:
+            out["returnOnEquity"] = net_income / equity
+
+    # --- Return on Assets ---
+    if out.get("returnOnAssets") is None:
+        net_income = _row(income, "Net Income", "Net Income Common Stockholders")
+        total_assets = _row(balance, "Total Assets")
+        if net_income is not None and total_assets:
+            out["returnOnAssets"] = net_income / total_assets
+
+    # --- Current Ratio ---
+    if out.get("currentRatio") is None:
+        ca = _row(balance, "Current Assets", "Total Current Assets")
+        cl = _row(balance, "Current Liabilities", "Total Current Liabilities")
+        if ca is not None and cl:
+            out["currentRatio"] = ca / cl
+
+    # --- Debt to Equity (yfinance sometimes reports this oddly-scaled too) ---
+    de = out.get("debtToEquity")
+    if de is None:
+        td = out.get("totalDebt")
+        equity = _row(balance, "Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest")
+        if td is not None and equity:
+            out["debtToEquity"] = (td / equity) * 100
+    elif de is not None and de < 5 and out.get("totalDebt") and balance is not None:
+        # Sanity check: if debtToEquity looks like a raw ratio (e.g. 0.4)
+        # rather than the percentage yfinance normally reports (e.g. 40),
+        # rescale it so downstream code (which expects percentage-scale) is consistent.
+        equity = _row(balance, "Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest")
+        if equity:
+            implied_pct = (out["totalDebt"] / equity) * 100
+            if abs(implied_pct - de) > abs(implied_pct - de * 100):
+                out["debtToEquity"] = de * 100
+
+    # --- Net profit margin (fallback if missing) ---
+    if out.get("profitMargins") is None:
+        net_income = _row(income, "Net Income", "Net Income Common Stockholders")
+        revenue = _row(income, "Total Revenue")
+        if net_income is not None and revenue:
+            out["profitMargins"] = net_income / revenue
+
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -485,10 +630,29 @@ st.sidebar.divider()
 # Sector browser as an alternative way to pick a company
 with st.sidebar.expander("Browse by name (A–Z)"):
     all_names = sorted(COMPANIES.keys())
-    browse_pick = st.selectbox("All companies", ["—"] + all_names, label_visibility="collapsed")
+    browse_pick = st.selectbox("All companies", ["—"] + all_names, label_visibility="collapsed", key="browse_name")
     if browse_pick != "—":
         st.session_state.selected_name = browse_pick
         st.session_state.selected_ticker = COMPANIES[browse_pick]
+
+with st.sidebar.expander("Browse by category"):
+    cat_options = sorted(CATEGORIES.keys(), key=lambda c: (-len(CATEGORIES[c]), c))
+    cat_pick = st.selectbox(
+        "Category", ["—"] + [f"{c} ({len(CATEGORIES[c])})" for c in cat_options],
+        label_visibility="collapsed", key="browse_cat_select",
+    )
+    if cat_pick != "—":
+        chosen_cat = cat_options[[f"{c} ({len(CATEGORIES[c])})" for c in cat_options].index(cat_pick)]
+        cat_companies = sorted(CATEGORIES[chosen_cat])
+        cat_company_pick = st.selectbox(
+            f"Company in {chosen_cat}", ["—"] + [f"{n}  ({t})" for n, t in cat_companies],
+            key="browse_cat_company",
+        )
+        if cat_company_pick != "—":
+            idx = [f"{n}  ({t})" for n, t in cat_companies].index(cat_company_pick)
+            picked_name, picked_ticker = cat_companies[idx]
+            st.session_state.selected_name = picked_name
+            st.session_state.selected_ticker = picked_ticker
 
 st.sidebar.divider()
 
@@ -556,11 +720,20 @@ with tab_research:
                 "rate-limiting requests right now. Try again shortly."
             )
         else:
+            # Backfill fields yfinance's summary dict frequently omits
+            # (freeCashflow, ROE, current ratio, etc.) using the raw
+            # financial statements, and normalize dividend yield units.
+            fin_for_backfill = get_financials(ticker)
+            info = derive_missing_metrics(info, fin_for_backfill)
+
             # ---- Header ----
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.header(safe(info, "longName", name))
-                st.caption(f"{ticker}  ·  {safe(info, 'sector')}  ·  {safe(info, 'industry')}")
+                st.caption(
+                    f"{ticker}  ·  {safe(info, 'sector')}  ·  {safe(info, 'industry')}  ·  "
+                    f"App category: **{category_of(ticker)}**"
+                )
             with col2:
                 price = info.get("currentPrice")
                 prev = info.get("previousClose")
@@ -855,13 +1028,24 @@ high growth) — always read the full picture before drawing conclusions.
 
                 fcf = info.get("freeCashflow")
                 shares = info.get("sharesOutstanding")
+                sector = info.get("sector", "")
 
                 if not fcf or not shares or fcf <= 0:
+                    bank_note = (
+                        " Banks/NBFCs/insurers don't have a meaningful 'Free Cash "
+                        "Flow' the way industrial companies do — this metric isn't "
+                        "designed for financial-sector companies at all, so no "
+                        "amount of data backfilling fixes that; a dividend-discount "
+                        "or excess-return model would be the appropriate approach instead."
+                        if any(k in (sector or "").lower() for k in ["financ", "bank"])
+                        else " This can happen for companies with genuinely negative "
+                        "free cash flow (heavy capex phase, cyclical downturn, etc), "
+                        "or where yfinance doesn't have cash flow statement data for "
+                        "this ticker at all."
+                    )
                     st.error(
-                        "Cannot run a DCF here: this ticker has no positive "
-                        "reported Free Cash Flow via yfinance (common for banks/"
-                        "financials, which need a different model, or companies "
-                        "with negative FCF)."
+                        "Cannot run a DCF here: no usable positive Free Cash Flow "
+                        f"figure is available for this company.{bank_note}"
                     )
                 else:
                     dc1, dc2, dc3, dc4 = st.columns(4)
@@ -1096,9 +1280,11 @@ with tab_peers:
     st.subheader("🏭 Sector Peer Benchmarking")
     st.caption(
         "Compares the selected company against other companies in this app's "
-        "database that share the same Yahoo Finance sector classification. "
-        "This uses sector-level tags, not a formal 'industry/market share' "
-        "analysis — see the Business & Revenue tab for that distinction."
+        "curated category list (see the Directory tab's category breakdown) — "
+        "not Yahoo Finance's own sector/industry tags, which are frequently "
+        "missing or inconsistent for NSE tickers. This is sector-level "
+        "grouping, not a formal 'industry/market share' analysis — see the "
+        "Business & Revenue tab for that distinction."
     )
 
     if not st.session_state.selected_ticker:
@@ -1106,53 +1292,54 @@ with tab_peers:
     else:
         base_ticker = st.session_state.selected_ticker
         base_name = st.session_state.selected_name
-        base_info = get_info(base_ticker)
+        base_category = category_of(base_ticker)
 
-        if base_info is None:
-            st.error("Could not fetch data for the selected company.")
+        st.write(f"**{base_name}** is grouped under **{base_category}** "
+                  f"({len(CATEGORIES.get(base_category, []))} companies in this category).")
+
+        # Instant local lookup — no API calls needed to find candidate peers,
+        # since categorization comes from our own curated database, not Yahoo.
+        all_peers_in_category = [
+            (n, t) for n, t in CATEGORIES.get(base_category, []) if t != base_ticker
+        ]
+
+        if not all_peers_in_category:
+            st.warning(
+                f"No other companies found in the '{base_category}' category. "
+                "Try the Compare tab to manually pick companies instead."
+            )
         else:
-            base_sector = base_info.get("sector")
-            base_industry = base_info.get("industry")
-            st.write(f"**{base_name}** is classified under sector **{base_sector or 'N/A'}**, industry **{base_industry or 'N/A'}**.")
+            max_available = len(all_peers_in_category)
+            n_peers = st.slider(
+                "Number of peers to fetch & display", 5, min(50, max_available),
+                min(15, max_available),
+            )
 
-            n_peers = st.slider("Number of peers to scan (from database, sorted by market cap)", 5, 40, 15)
-
-            with st.spinner("Scanning database for sector peers... (first run may take a bit)"):
-                # Sample from the company database — cap scanning to keep it fast on free tier
-                sample_names = list(COMPANIES.keys())
+            with st.spinner(f"Fetching data for up to {n_peers} peers..."):
                 peer_rows = []
-                scanned = 0
-                max_scan = 120  # safety cap so this doesn't hammer the API on a huge db
-                for pname in sample_names:
-                    if scanned >= max_scan:
-                        break
-                    ptick = COMPANIES[pname]
-                    if ptick == base_ticker:
-                        continue
-                    pinfo = get_info(ptick)
-                    scanned += 1
-                    if pinfo is None:
-                        continue
-                    if pinfo.get("sector") == base_sector and base_sector is not None:
-                        peer_rows.append({
-                            "Company": pname,
-                            "Ticker": ptick,
-                            "Industry": pinfo.get("industry"),
-                            "Market Cap": pinfo.get("marketCap") or 0,
-                            "P/E": pinfo.get("trailingPE"),
-                            "ROE": pinfo.get("returnOnEquity"),
-                            "Net Margin": pinfo.get("profitMargins"),
-                            "Revenue Growth": pinfo.get("revenueGrowth"),
-                        })
+                for pname, ptick in all_peers_in_category:
                     if len(peer_rows) >= n_peers:
                         break
+                    pinfo = get_info(ptick)
+                    if pinfo is None:
+                        continue
+                    pinfo = lightweight_backfill(pinfo)
+                    peer_rows.append({
+                        "Company": pname,
+                        "Ticker": ptick,
+                        "Industry": pinfo.get("industry") or "—",
+                        "Market Cap": pinfo.get("marketCap") or 0,
+                        "P/E": pinfo.get("trailingPE"),
+                        "ROE": pinfo.get("returnOnEquity"),
+                        "Net Margin": pinfo.get("profitMargins"),
+                        "Revenue Growth": pinfo.get("revenueGrowth"),
+                    })
 
             if not peer_rows:
                 st.warning(
-                    "No sector peers found in the scanned sample. This can happen if "
-                    "the sector field is missing, or if peers weren't within the scan "
-                    "limit — try increasing 'Number of peers to scan' or browse the "
-                    "Directory tab manually for related companies."
+                    "Found companies in this category, but couldn't fetch live "
+                    "data for any of them right now — Yahoo Finance may be "
+                    "rate-limiting requests. Try again shortly."
                 )
             else:
                 peer_df = pd.DataFrame(peer_rows).sort_values("Market Cap", ascending=False)
@@ -1194,6 +1381,7 @@ with tab_compare:
                 cinfo = get_info(ctick)
                 if cinfo is None:
                     continue
+                cinfo = derive_missing_metrics(cinfo, get_financials(ctick))
                 rows.append({
                     "Company": cname,
                     "Ticker": ctick,
@@ -1267,9 +1455,14 @@ with tab_watchlist:
 # ============================== DIRECTORY TAB ==============================
 with tab_directory:
     st.subheader(f"📋 Full Company Directory ({company_count()} entries)")
-    dir_search = st.text_input("Filter directory", placeholder="Type to filter by name or ticker...")
+
+    dc1, dc2 = st.columns([2, 1])
+    dir_search = dc1.text_input("Filter directory", placeholder="Type to filter by name or ticker...")
+    cat_filter_options = ["All categories"] + sorted(CATEGORIES.keys(), key=lambda c: (-len(CATEGORIES[c]), c))
+    dir_cat_filter = dc2.selectbox("Category", cat_filter_options)
+
     dir_df = pd.DataFrame(
-        [{"Company": n, "Ticker": t} for n, t in sorted(COMPANIES.items())]
+        [{"Company": n, "Ticker": t, "Category": category_of(t)} for n, t in sorted(COMPANIES.items())]
     )
     if dir_search:
         mask = (
@@ -1277,8 +1470,25 @@ with tab_directory:
             | dir_df["Ticker"].str.contains(dir_search, case=False)
         )
         dir_df = dir_df[mask]
+    if dir_cat_filter != "All categories":
+        dir_df = dir_df[dir_df["Category"] == dir_cat_filter]
+
     st.dataframe(dir_df, use_container_width=True, height=500)
-    st.caption("To research a company, search for it in the sidebar or copy its ticker there.")
+    st.caption(
+        f"Showing {len(dir_df)} of {company_count()} entries. Category is a "
+        "static, curated grouping (see categories.py) — independent of "
+        "Yahoo Finance's own sector/industry tags, which are missing or "
+        "inconsistent for many NSE tickers. To research a company, search "
+        "for it in the sidebar or copy its ticker there."
+    )
+
+    with st.expander("📊 Category breakdown"):
+        cat_counts = pd.DataFrame(
+            [{"Category": c, "Companies": len(items)} for c, items in CATEGORIES.items()]
+        ).sort_values("Companies", ascending=False)
+        cat_fig = px.bar(cat_counts, x="Companies", y="Category", orientation="h", height=550)
+        cat_fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(autorange="reversed"))
+        st.plotly_chart(cat_fig, use_container_width=True)
 
 st.divider()
 st.caption(
