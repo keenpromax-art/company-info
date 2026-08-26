@@ -319,6 +319,8 @@ COMPANIES = {
     "Gujarat Gas": "GUJGASLTD.NS",
     "Gujarat State Petronet": "GSPL.NS",
     "Aegis Logistics": "AEGISCHEM.NS",
+
+    # ---------------- Renewable Energy / Power ----------------
     "NHPC": "NHPC.NS",
     "SJVN": "SJVN.NS",
     "Torrent Power (see above)": "TORNTPOWER.NS",
